@@ -23,6 +23,7 @@
 - [教材設計原則](docs/principles.md)
 - [全体カリキュラム案](docs/curriculum.md)
 - [教材開発ガイド](docs/development.md)
+- [外部データ利用方針](docs/data-policy.md)
 - [予測課題のデータ候補](docs/prediction-data-candidates.md)
 
 ## 現時点での対象外
