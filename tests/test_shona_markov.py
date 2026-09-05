@@ -39,6 +39,21 @@ class ParseTests(unittest.TestCase):
             for item in set(items):
                 self.assertEqual(items.count(item), forms[item])
 
+    def test_seeded_split_does_not_depend_on_source_row_order(self):
+        ordered = {
+            ("x", "a"): 3,
+            ("x", "e"): 2,
+            ("x", "i"): 2,
+            ("x", "o"): 2,
+            ("x", "u"): 2,
+            ("y", "a"): 2,
+        }
+        reversed_order = dict(reversed(list(ordered.items())))
+        self.assertEqual(
+            shona.split_forms(ordered, seed=20260905),
+            shona.split_forms(reversed_order, seed=20260905),
+        )
+
 
 class TargetAndModelTests(unittest.TestCase):
     def test_final_target_exclusion(self):
