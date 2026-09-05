@@ -16,8 +16,8 @@ class ParseTests(unittest.TestCase):
     def test_parse_weights_and_vowels(self):
         raw = b"b a n d i r a\t2\nch e r e ng a 1\n"
         corpus = shona.parse(raw)
-        self.assertEqual(corpus.source_rows, 2)
-        self.assertEqual(corpus.entries, 3)
+        self.assertEqual(corpus.rows, 2)
+        self.assertEqual(shona.entry_count(corpus), 3)
         self.assertEqual(corpus.form_counts[("b", "a", "n", "d", "i", "r", "a")], 2)
         self.assertEqual(shona.vowels(("b", "a", "n", "d", "i", "r", "a")), ("a", "i", "a"))
 
@@ -57,11 +57,13 @@ class TargetAndModelTests(unittest.TestCase):
         self.assertGreater(bigram.probs(("a",))["i"], unigram.probs(())["i"])
         self.assertGreater(bigram.probs(("i",))["a"], unigram.probs(())["a"])
 
-    def test_second_order_uses_shorter_history_for_first_transition(self):
-        model = shona.Model(2, alpha=0.5)
-        model.fit([("a", "i", "a"), ("a", "i", "a")], exclude_final=False)
-        self.assertGreater(model.probs(("a",))["i"], 0.2)
-        self.assertGreater(model.probs(("a", "i"))["a"], 0.2)
+    def test_second_order_uses_global_first_order_backoff(self):
+        sequences = [("a", "i", "a"), ("u", "a", "i")]
+        first = shona.Model(1, alpha=0.5)
+        second = shona.Model(2, alpha=0.5)
+        first.fit(sequences, exclude_final=False)
+        second.fit(sequences, exclude_final=False)
+        self.assertEqual(first.probs(("a",)), second.probs(("a",)))
 
     def test_metrics_are_finite(self):
         sequences = [("a", "i", "a"), ("u", "u", "a"), ("o", "o", "a")]
