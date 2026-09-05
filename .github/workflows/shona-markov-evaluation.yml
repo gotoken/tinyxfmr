@@ -36,7 +36,14 @@ jobs:
             --json-output artifacts/shona-markov-results.json
 
       - name: Verify committed report is reproducible
-        run: diff -u docs/reports/shona-markov-evaluation.md artifacts/shona-markov-evaluation.md
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          committed = Path("docs/reports/shona-markov-evaluation.md").read_text(encoding="utf-8").rstrip("\n")
+          generated = Path("artifacts/shona-markov-evaluation.md").read_text(encoding="utf-8").rstrip("\n")
+          if committed != generated:
+              raise SystemExit("committed report differs from generated report")
+          PY
 
       - name: Show generated report in job summary
         if: always()
