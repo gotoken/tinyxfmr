@@ -77,7 +77,7 @@ def vowels(form: Sequence[str]) -> tuple[str, ...]:
 
 def split_forms(form_counts: Mapping[tuple[str, ...], int], seed: int) -> dict[str, tuple[tuple[str, ...], ...]]:
     """Split 80/10/10 by exact source form, keeping duplicates in one split."""
-    groups = list(form_counts.items())
+    groups = sorted(form_counts.items())
     random.Random(seed).shuffle(groups)
     total = sum(n for _, n in groups)
     train_cut, val_cut = total * 0.8, total * 0.9
