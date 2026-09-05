@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Evaluate unigram, first-order and second-order next-vowel models on Shona verbs.
+"""Evaluate low-order next-vowel models on Hayes & Wilson's published Shona data.
 
-The Hayes & Wilson learning data are fetched at run time. The source data and per-word
-vowel sequences are never written to the repository; only aggregate statistics are emitted.
+The source corpus is fetched at run time. tinyxfmr stores only code and aggregate
+statistics, never the source lexicon or the full derived vowel sequences.
 """
 from __future__ import annotations
 
@@ -23,8 +23,13 @@ VOWEL_SET = set(VOWELS)
 DATA_URL = "https://brucehayes.org/Phonotactics/files/ShonaLearningData.txt"
 SEED = 20260905
 ALPHA = 0.5
+# The paper says 4,399 verbs. The file currently served by the authors has 4,395
+# non-empty rows; later work using the Hayes/Wilson Shona data also reports 4,395.
+EXPECTED_ROWS = 4395
+EXPECTED_SHA256 = "ecee3f5fe3ede70871530eb8a4cd1496b63283b49f568e7116bda61200448fbb"
 
-# Hayes & Wilson (2008), Table 6: Shona vowel distribution, raw counts.
+# Hayes & Wilson (2008), Table 6. This is a reference comparison, not an
+# assertion about the currently served file: the two releases differ slightly.
 TABLE6 = {
     "aa": 1443, "ae": 3, "ao": 0, "ai": 500, "au": 568,
     "ea": 639, "ee": 587, "eo": 0, "ei": 2, "eu": 260,
@@ -37,81 +42,99 @@ TABLE6 = {
 @dataclass(frozen=True)
 class Corpus:
     sha256: str
-    source_rows: int
-    entries: int
+    rows: int
     form_counts: Mapping[tuple[str, ...], int]
 
 
 def parse(raw: bytes) -> Corpus:
-    counts: collections.Counter[tuple[str, ...]] = collections.Counter()
-    source_rows = entries = 0
+    """Parse one space-separated phoneme sequence plus its final frequency field."""
+    form_counts: collections.Counter[tuple[str, ...]] = collections.Counter()
+    rows = 0
     for lineno, line in enumerate(raw.decode("utf-8-sig").splitlines(), 1):
         fields = line.split()
         if not fields:
             continue
         if len(fields) < 2:
-            raise ValueError(f"line {lineno}: missing count")
+            raise ValueError(f"line {lineno}: expected phonemes followed by a frequency")
         try:
-            n = int(fields[-1])
+            frequency = int(fields[-1])
         except ValueError as exc:
-            raise ValueError(f"line {lineno}: invalid count {fields[-1]!r}") from exc
-        if n <= 0:
-            raise ValueError(f"line {lineno}: count must be positive")
-        counts[tuple(fields[:-1])] += n
-        source_rows += 1
-        entries += n
-    return Corpus(hashlib.sha256(raw).hexdigest(), source_rows, entries, dict(counts))
+            raise ValueError(f"line {lineno}: invalid frequency {fields[-1]!r}") from exc
+        if frequency <= 0:
+            raise ValueError(f"line {lineno}: frequency must be positive")
+        form_counts[tuple(fields[:-1])] += frequency
+        rows += 1
+    return Corpus(hashlib.sha256(raw).hexdigest(), rows, dict(form_counts))
+
+
+def entry_count(corpus: Corpus) -> int:
+    return sum(corpus.form_counts.values())
 
 
 def vowels(form: Sequence[str]) -> tuple[str, ...]:
-    return tuple(x for x in form if x in VOWEL_SET)
+    return tuple(token for token in form if token in VOWEL_SET)
 
 
 def split_forms(form_counts: Mapping[tuple[str, ...], int], seed: int) -> dict[str, tuple[tuple[str, ...], ...]]:
-    """80/10/10 split, grouping exact duplicate forms to avoid train/test leakage."""
+    """Split 80/10/10 by exact source form, keeping duplicates in one split."""
     groups = list(form_counts.items())
     random.Random(seed).shuffle(groups)
     total = sum(n for _, n in groups)
-    cuts = (0.8 * total, 0.9 * total)
-    out = {"train": [], "validation": [], "test": []}
+    train_cut, val_cut = total * 0.8, total * 0.9
+    result: dict[str, list[tuple[str, ...]]] = {"train": [], "validation": [], "test": []}
     assigned = 0
     for form, n in groups:
         midpoint = assigned + n / 2
-        bucket = "train" if midpoint < cuts[0] else "validation" if midpoint < cuts[1] else "test"
-        out[bucket].extend([form] * n)
+        split = "train" if midpoint < train_cut else "validation" if midpoint < val_cut else "test"
+        result[split].extend([form] * n)
         assigned += n
-    return {k: tuple(v) for k, v in out.items()}
+    return {name: tuple(items) for name, items in result.items()}
 
 
 def examples(seq: Sequence[str], exclude_final: bool) -> Iterable[tuple[tuple[str, ...], str]]:
-    for i in range(1, len(seq)):
-        if exclude_final and i == len(seq) - 1:
+    for target_index in range(1, len(seq)):
+        if exclude_final and target_index == len(seq) - 1:
             continue
-        yield tuple(seq[:i]), seq[i]
+        yield tuple(seq[:target_index]), seq[target_index]
 
 
 class Model:
-    def __init__(self, order: int, alpha: float):
-        if order not in (0, 1, 2) or alpha <= 0:
-            raise ValueError("order must be 0..2 and alpha > 0")
-        self.order, self.alpha = order, alpha
-        self.counts: collections.defaultdict[tuple[str, ...], collections.Counter[str]] = collections.defaultdict(collections.Counter)
+    """0/1/2-order additive-smoothed Markov model.
 
-    def context(self, history: Sequence[str]) -> tuple[str, ...]:
-        if self.order == 0:
-            return ()
-        return tuple(history[-min(self.order, len(history)):])
+    A second-order model also accumulates first-order counts. Therefore the first
+    predictable vowel, which has only one preceding vowel and no BOS symbol, uses
+    the same first-order statistics rather than gaining an implicit position cue.
+    """
+
+    def __init__(self, order: int, alpha: float):
+        if order not in (0, 1, 2):
+            raise ValueError("order must be 0, 1, or 2")
+        if alpha <= 0:
+            raise ValueError("alpha must be positive")
+        self.order = order
+        self.alpha = alpha
+        self.counts: collections.defaultdict[tuple[str, ...], collections.Counter[str]] = collections.defaultdict(collections.Counter)
 
     def fit(self, seqs: Iterable[Sequence[str]], exclude_final: bool) -> None:
         self.counts.clear()
         for seq in seqs:
             for history, target in examples(seq, exclude_final):
-                self.counts[self.context(history)][target] += 1
+                max_width = min(self.order, len(history))
+                # Store all usable suffix contexts so lower-order backoff is estimated
+                # from all training targets, not only word-initial positions.
+                for width in range(max_width + 1):
+                    context = () if width == 0 else tuple(history[-width:])
+                    self.counts[context][target] += 1
+
+    def context(self, history: Sequence[str]) -> tuple[str, ...]:
+        width = min(self.order, len(history))
+        return () if width == 0 else tuple(history[-width:])
 
     def probs(self, history: Sequence[str]) -> dict[str, float]:
-        c = self.counts.get(self.context(history), collections.Counter())
-        z = sum(c.values()) + self.alpha * len(VOWELS)
-        return {v: (c[v] + self.alpha) / z for v in VOWELS}
+        context = self.context(history)
+        counts = self.counts.get(context, collections.Counter())
+        denominator = sum(counts.values()) + self.alpha * len(VOWELS)
+        return {v: (counts[v] + self.alpha) / denominator for v in VOWELS}
 
 
 @dataclass(frozen=True)
@@ -140,28 +163,30 @@ def evaluate(model: Model, seqs: Iterable[Sequence[str]], exclude_final: bool) -
 
 
 def pair_counts(seqs: Iterable[Sequence[str]]) -> collections.Counter[str]:
-    c: collections.Counter[str] = collections.Counter()
+    result: collections.Counter[str] = collections.Counter()
     for seq in seqs:
-        c.update(a + b for a, b in zip(seq, seq[1:]))
-    return c
+        result.update(a + b for a, b in zip(seq, seq[1:]))
+    return result
 
 
 def run(corpus: Corpus, seed: int, alpha: float) -> dict:
     split = split_forms(corpus.form_counts, seed)
-    seqs = {k: tuple(vowels(form) for form in forms) for k, forms in split.items()}
+    seqs = {name: tuple(vowels(form) for form in forms) for name, forms in split.items()}
     allseq = tuple(vowels(form) for form, n in corpus.form_counts.items() for _ in range(n))
     if any(not seq for seq in allseq):
         raise ValueError("source contains an entry without a/e/i/o/u")
 
-    vf = collections.Counter(v for seq in allseq for v in seq)
+    vowel_counts = collections.Counter(v for seq in allseq for v in seq)
     lengths = collections.Counter(map(len, allseq))
     pairs = pair_counts(allseq)
-    table6_diff = {pair: {"expected": n, "actual": pairs[pair]} for pair, n in TABLE6.items() if pairs[pair] != n}
+    table6_diff = {
+        pair: {"table6": expected, "current_file": pairs[pair], "delta": pairs[pair] - expected}
+        for pair, expected in TABLE6.items() if pairs[pair] != expected
+    }
 
     conditions = {}
     for name, exclude_final in (("include-final", False), ("exclude-final-target", True)):
-        models = {}
-        metrics = {}
+        models, metrics = {}, {}
         for order in (0, 1, 2):
             model = Model(order, alpha)
             model.fit(seqs["train"], exclude_final)
@@ -177,9 +202,14 @@ def run(corpus: Corpus, seed: int, alpha: float) -> dict:
         conditions[name] = {"models": models, "metrics": metrics, "sensitivity": sensitivity}
 
     return {
-        "split": split, "seqs": seqs, "allseq": allseq, "vowels": vf, "lengths": lengths,
-        "pairs": pairs, "table6_diff": table6_diff, "conditions": conditions,
-        "seed": seed, "alpha": alpha,
+        "split": split,
+        "vowels": vowel_counts,
+        "lengths": lengths,
+        "pairs": pairs,
+        "table6_diff": table6_diff,
+        "conditions": conditions,
+        "seed": seed,
+        "alpha": alpha,
     }
 
 
@@ -192,7 +222,6 @@ def table(headers: Sequence[str], rows: Iterable[Sequence[object]]) -> str:
 
 
 def probability_table(model: Model) -> str:
-    contexts: list[tuple[str, ...]]
     if model.order == 0:
         contexts = [()]
     elif model.order == 1:
@@ -207,69 +236,71 @@ def probability_table(model: Model) -> str:
 
 
 def render(corpus: Corpus, r: Mapping[str, object], source: str) -> str:
-    split = r["split"]
-    vf = r["vowels"]
-    lengths = r["lengths"]
-    pairs = r["pairs"]
+    split, vc, lengths, pairs = r["split"], r["vowels"], r["lengths"], r["pairs"]
     conditions = r["conditions"]
-    total_vowels = sum(vf.values())
+    total_vowels = sum(vc.values())
+    entries = entry_count(corpus)
     lines = [
         "# Shona 母音列の低次 Markov 予測評価", "",
-        "元4,399語および全件の母音列は収録せず、公開データから再計算できる集計統計だけを記録する。", "",
-        "## データと方法", "",
+        "Hayes & Wilson の公開 Shona learning data を外部取得して評価した。元データや全件の派生母音列はリポジトリへ収録しない。", "",
+        "## データと再現条件", "",
         f"- learning data: <{source}>",
         "- Bruce Hayes & Colin Wilson (2008), *Linguistic Inquiry* 39(3), 379–440, DOI: <https://doi.org/10.1162/ling.2008.39.3.379>",
-        f"- source SHA-256: `{corpus.sha256}`",
-        f"- 非空ソース行: {corpus.source_rows:,}; count 展開後: {corpus.entries:,}; 完全一致音素列: {len(corpus.form_counts):,}",
-        f"- split: 80/10/10、seed `{r['seed']}`。完全一致音素列は同じ split にまとめた。",
+        f"- 取得ファイル SHA-256: `{corpus.sha256}`",
+        f"- 現行公開ファイル: 非空 {corpus.rows:,} 行、frequency 展開後 {entries:,} エントリ、完全一致音素列 {len(corpus.form_counts):,} 種。",
+        "- 論文本文は 4,399 動詞と記載する一方、現行公開ファイルは 4,395 行である。2019年の同データ利用研究も Shona の size を 4,395 と報告しているため、現行公開版を 4,395 語版として評価する。",
+        "- 2019 reference: <https://aclanthology.org/W19-42.pdf>（Table 1 で Shona = 4,395）。",
+        f"- split: train/validation/test = 80/10/10、seed `{r['seed']}`。完全一致音素列は同じ split にまとめ、重複リークを防ぐ。",
         f"- additive smoothing α={r['alpha']}。α=0.1/0.5/1.0 でも感度確認する。",
-        "- BOS/EOSは使わない。2次モデルは履歴が1母音しかない最初の遷移だけ1次文脈を使う。", "",
-        table(["split", "語エントリ"], [[k, f"{len(v):,}"] for k, v in split.items()]), "",
+        "- BOS/EOS は使わない。2次モデルの最初の予測は、全訓練遷移から推定した1次分布へ戻る。", "",
+        table(["split", "語エントリ"], [[name, f"{len(forms):,}"] for name, forms in split.items()]), "",
         "## 基本統計", "", "### 母音数による語長", "",
         table(["母音数", "語数"], [[n, f"{lengths[n]:,}"] for n in sorted(lengths)]), "",
-        "### 母音頻度", "",
-        table(["母音", "回数", "割合"], [[v, f"{vf[v]:,}", f"{vf[v]/total_vowels:.4f}"] for v in VOWELS]), "",
-        "### 5×5 遷移回数", "",
+        "### 5母音の出現頻度", "",
+        table(["母音", "回数", "割合"], [[v, f"{vc[v]:,}", f"{vc[v]/total_vowels:.4f}"] for v in VOWELS]), "",
+        "### 5×5 二母音遷移回数", "",
         table(["現在\\次", *VOWELS], [[a, *(f"{pairs[a+b]:,}" for b in VOWELS)] for a in VOWELS]), "",
-        "### 5×5 遷移確率", "",
-        table(["現在\\次", *VOWELS], [
-            [a, *(f"{pairs[a+b]/sum(pairs[a+x] for x in VOWELS):.4f}" for b in VOWELS)] for a in VOWELS
-        ]), "", "### Hayes & Wilson Table 6 照合", "",
+        "### 5×5 二母音遷移確率", "",
+        table(["現在\\次", *VOWELS], [[a, *(f"{pairs[a+b]/sum(pairs[a+x] for x in VOWELS):.4f}" for b in VOWELS)] for a in VOWELS]), "",
+        "### Hayes & Wilson (2008) Table 6 との照合", "",
+        "現行公開ファイルは論文 Table 6 と完全一致しない。これは失敗条件とはせず、公開版の差として記録する。", "",
     ]
     if r["table6_diff"]:
-        lines += ["**不一致あり。**", "", table(["pair", "Table 6", "取得データ"], [
-            [p, x["expected"], x["actual"]] for p, x in sorted(r["table6_diff"].items())
-        ])]
+        lines.append(table(["pair", "Table 6", "現行ファイル", "差"], [
+            [pair, values["table6"], values["current_file"], f"{values['delta']:+d}"]
+            for pair, values in sorted(r["table6_diff"].items())
+        ]))
     else:
-        lines += ["**25通りすべて一致。** 公開 learning data の隣接母音対は論文 Table 6 を再現した。"]
+        lines.append("25通りすべて一致した。")
 
-    lines += ["", "## 予測性能", ""]
     names = {0: "unigram", 1: "1次 Markov", 2: "2次 Markov"}
-    for cname, c in conditions.items():
+    lines += ["", "## 予測性能", ""]
+    for cname, condition in conditions.items():
         title = "語末 a を含む通常条件" if cname == "include-final" else "最終母音への予測を除外"
-        m = c["metrics"]
+        m = condition["metrics"]
         lines += [f"### {title}", "", table(
-            ["モデル", "test targets", "NLL (nats)", "bits/token", "perplexity", "top-1 accuracy"],
+            ["モデル", "test targets", "NLL (nats)", "cross entropy (bits/token)", "perplexity", "top-1 accuracy"],
             [[names[o], f"{m[o].targets:,}", f"{m[o].nll_nats:.3f}", f"{m[o].bits:.4f}", f"{m[o].perplexity:.4f}", f"{m[o].accuracy:.4f}"] for o in (0, 1, 2)]
         ), "",
         f"- unigram → 1次: **{m[0].bits-m[1].bits:+.4f} bits/token**",
         f"- 1次 → 2次: **{m[1].bits-m[2].bits:+.4f} bits/token**", "",
         "#### smoothing 感度", "", table(
             ["α", "unigram", "1次", "2次", "uni→1次", "1次→2次"],
-            [[a, f"{c['sensitivity'][a][0]:.4f}", f"{c['sensitivity'][a][1]:.4f}", f"{c['sensitivity'][a][2]:.4f}",
-              f"{c['sensitivity'][a][0]-c['sensitivity'][a][1]:+.4f}", f"{c['sensitivity'][a][1]-c['sensitivity'][a][2]:+.4f}"] for a in ("0.1", "0.5", "1.0")]
+            [[a, f"{condition['sensitivity'][a][0]:.4f}", f"{condition['sensitivity'][a][1]:.4f}", f"{condition['sensitivity'][a][2]:.4f}",
+              f"{condition['sensitivity'][a][0]-condition['sensitivity'][a][1]:+.4f}",
+              f"{condition['sensitivity'][a][1]-condition['sensitivity'][a][2]:+.4f}"] for a in ("0.1", "0.5", "1.0")]
         ), "", "#### train から推定した予測分布", ""]
         for order in (0, 1, 2):
-            lines += [f"**{names[order]}**", "", probability_table(c["models"][order]), ""]
+            lines += [f"**{names[order]}**", "", probability_table(condition["models"][order]), ""]
 
-    inc = conditions["include-final"]["metrics"]
-    exc = conditions["exclude-final-target"]["metrics"]
+    inc, exc = conditions["include-final"]["metrics"], conditions["exclude-final-target"]["metrics"]
     lines += [
-        "## 教材適性の判断材料", "",
-        f"- 通常条件: unigram→1次 {inc[0].bits-inc[1].bits:+.4f} bits/token、1次→2次 {inc[1].bits-inc[2].bits:+.4f} bits/token。",
-        f"- 語末予測除外: unigram→1次 {exc[0].bits-exc[1].bits:+.4f} bits/token、1次→2次 {exc[1].bits-exc[2].bits:+.4f} bits/token。",
-        "- 5×5表で母音調和由来の極端に少ない遷移が直接見えるため、頻度→条件付き頻度の導入に使いやすい。",
-        "- 採用判断では、1次での改善が明瞭か、2次の追加改善が相対的に小さいか、語末 a を除いても同じ傾向かを確認する。", "",
+        "## 教材としての結論", "",
+        f"通常条件では unigram→1次が **{inc[0].bits-inc[1].bits:.4f} bits/token**、1次→2次が **{inc[1].bits-inc[2].bits:.4f} bits/token** 改善する。",
+        f"語末への予測を除くと unigram→1次は **{exc[0].bits-exc[1].bits:.4f} bits/token** 改善する一方、1次→2次は **{exc[1].bits-exc[2].bits:.4f} bits/token** に縮む。", "",
+        "したがって **Shona 母音列は第1〜2回の主要データとして採用する価値が高い**。特に語末 `-a` の予測を除いた条件は、無条件頻度の限界が大きく、直前1母音を見ることで大幅に改善し、それより長い履歴の追加利得は小さいという教材上望ましい形を示す。", "",
+        "5×5表にも `a→o`, `e→o`, `i→e`, `i→o` などゼロまたはほぼゼロのセルが現れ、母音調和を規則の事前説明なしに視覚的に発見できる。語末 `-a` を含めた通常条件では2次の追加利得がやや大きくなるため、教材の主たる評価・可視化では **最終母音への予測を除外**し、語末 `-a` の影響自体を補足実験として示すのが妥当である。", "",
+        "注意点として、論文の4,399語/Table 6と現行公開4,395語ファイルには小さな差がある。教材では『Hayes & Wilson (2008) が公開した現行 learning data 4,395行を利用した』と版を明示し、論文表との不一致を隠さない。", "",
         "## 再実行", "", "```bash",
         "python scripts/evaluate_shona_markov.py --output docs/reports/shona-markov-evaluation.md --json-output artifacts/shona-markov-results.json",
         "```", "",
@@ -279,50 +310,56 @@ def render(corpus: Corpus, r: Mapping[str, object], source: str) -> str:
 
 def as_json(corpus: Corpus, r: Mapping[str, object], source: str) -> dict:
     return {
-        "source_url": source, "source_sha256": corpus.sha256, "source_rows": corpus.source_rows,
-        "entries": corpus.entries, "unique_exact_forms": len(corpus.form_counts), "seed": r["seed"],
-        "split_sizes": {k: len(v) for k, v in r["split"].items()},
+        "source_url": source,
+        "source_sha256": corpus.sha256,
+        "source_rows": corpus.rows,
+        "entries": entry_count(corpus),
+        "unique_exact_forms": len(corpus.form_counts),
+        "seed": r["seed"],
+        "split_sizes": {name: len(forms) for name, forms in r["split"].items()},
         "vowel_lengths": dict(sorted(r["lengths"].items())),
         "vowel_frequencies": {v: r["vowels"][v] for v in VOWELS},
         "transition_counts": {a+b: r["pairs"][a+b] for a in VOWELS for b in VOWELS},
-        "table6_matches": not bool(r["table6_diff"]), "table6_differences": r["table6_diff"],
+        "table6_matches": not bool(r["table6_diff"]),
+        "table6_differences": r["table6_diff"],
         "conditions": {name: {
-            "metrics": {str(o): vars(c["metrics"][o]) for o in (0, 1, 2)},
-            "smoothing_sensitivity_bits": c["sensitivity"],
-        } for name, c in r["conditions"].items()},
+            "metrics": {str(order): vars(condition["metrics"][order]) for order in (0, 1, 2)},
+            "smoothing_sensitivity_bits": condition["sensitivity"],
+        } for name, condition in r["conditions"].items()},
     }
 
 
 def fetch(url: str) -> bytes:
-    req = urllib.request.Request(url, headers={"User-Agent": "tinyxfmr-shona-evaluation/1.0"})
-    with urllib.request.urlopen(req, timeout=30) as response:
+    request = urllib.request.Request(url, headers={"User-Agent": "tinyxfmr-shona-evaluation/1.0"})
+    with urllib.request.urlopen(request, timeout=30) as response:
         return response.read()
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--data-url", default=DATA_URL)
-    p.add_argument("--data-file", type=Path)
-    p.add_argument("--seed", type=int, default=SEED)
-    p.add_argument("--alpha", type=float, default=ALPHA)
-    p.add_argument("--output", type=Path, default=Path("artifacts/shona-markov-evaluation.md"))
-    p.add_argument("--json-output", type=Path, default=Path("artifacts/shona-markov-results.json"))
-    args = p.parse_args(argv)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--data-url", default=DATA_URL)
+    parser.add_argument("--data-file", type=Path)
+    parser.add_argument("--seed", type=int, default=SEED)
+    parser.add_argument("--alpha", type=float, default=ALPHA)
+    parser.add_argument("--output", type=Path, default=Path("artifacts/shona-markov-evaluation.md"))
+    parser.add_argument("--json-output", type=Path, default=Path("artifacts/shona-markov-results.json"))
+    parser.add_argument("--accept-source-change", action="store_true", help="run even if the public source fingerprint changed")
+    args = parser.parse_args(argv)
 
     raw = args.data_file.read_bytes() if args.data_file else fetch(args.data_url)
     corpus = parse(raw)
+    if not args.accept_source_change and (corpus.rows != EXPECTED_ROWS or corpus.sha256 != EXPECTED_SHA256):
+        print(
+            f"ERROR: public source changed: rows={corpus.rows}, sha256={corpus.sha256}; "
+            f"expected rows={EXPECTED_ROWS}, sha256={EXPECTED_SHA256}", file=sys.stderr,
+        )
+        return 2
+
     result = run(corpus, args.seed, args.alpha)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.json_output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(render(corpus, result, args.data_url), encoding="utf-8")
     args.json_output.write_text(json.dumps(as_json(corpus, result, args.data_url), ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-
-    if corpus.entries != 4399:
-        print(f"ERROR: expected 4,399 entries, got {corpus.entries}", file=sys.stderr)
-        return 2
-    if result["table6_diff"]:
-        print(f"ERROR: Hayes & Wilson Table 6 mismatch: {result['table6_diff']}", file=sys.stderr)
-        return 3
     print(f"wrote {args.output} and {args.json_output}")
     return 0
 
